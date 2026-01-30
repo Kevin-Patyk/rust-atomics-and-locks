@@ -7,6 +7,7 @@
 use std::thread;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::marker::PhantomData;
 
 fn f() {
     println!("Hello from another thread!");
@@ -399,6 +400,144 @@ fn main() {
     // That is, you have an immutable reference but you need to update some simple metadata or state
     // Cell lets you keep the API simple while still tracking internal state
 
-    // Refcell -----
+    // Cell is for when you want to:
+        // Keep your API simple with &self methods
+        // Modify some internal state from several places
+        // Avoid the hassle of &mut self everywhere
+    
+
+    // RefCell -----
+
+    // Unlike a regular Cell, a std::cell::RefCell does allow you to borrow its contents, at a small runetime cost
+    // A RefCell<T> does not only hold a T, but also holds a counter that keeps track of any outstanding borrows
+    // If you try to borrow it while it is already mutable borrowed, it will panic, which avoids undefined behavior
+    // Just like a Cell, a RefCell can only be used by a single thread
+    // Borrowing the contents of RefCell is done by calling .borrow() or .borrow_mut()
+    // While Cell and RefCell can be very useful, they become rather useless when we need to do something with multiple threads
+    
+    // Normally in Rust, the borrow checker enforces rules at compile time:
+        // You can have multiple immutable references or one mutable reference, but not both at the same time
+    // However, sometimes you need to mutate data even when you only have an immutable reference to it 
+
+    // RefCell moves borrow checking from compile time to runtime 
+    // Instead of the compiler checking the rules, RefCell checks them when your program runs
+
+    // Key characteristics:
+        // Single threaded only
+        // Runtime panics if you violate borrowing rules
+        // Zero cost abstraction
+    
+    // Common use-cases:
+        // Mutating data inside immutable structs
+        // Implementing data structures with shared ownership (often combined with Rc<RefCell<T>>)
+        // Mock objects in tests
+    
+    // Mutex and RwLock
+
+    // A RwLock or reader-write lock is the concurrent version of RefCell
+    // An RwLock<T> holds a T and tracks any outstanding borrows
+    // However, it does not panic on conflicting borrows
+    // Instead, it blocks the current thread, putting it to sleep, while waiting for conflicting borrows to disappear
+    // Borrowing the contents of an RwLock is called locking
+    // By locking it, we temporarily block concurrent conflicting borrows, allowing us to borrow it without causing data races
+
+    // In other words, RwLock<T> provides interior mutability in multi-threaded contexts with multiple concurrent readers or one exclusive writer
+    // When you have data that's read frequently but written rarely, a regular Mutex can be inefficient because it only allows one thread at a time, even for reads
+    // RwLock allows:
+        // Multiple threads to read simultaneously
+        // Only one thread to write (with exclusive access)
+    
+    // A Mutex is very similar, but conceptually simpler
+    // Instead of keeping track of the number of shared and exclusive borrows, it only allows exclusive borrows
+    // Only one thread can read or write at a time
+
+    // Atomics -----
+
+    // Atomics are lock-free, thread-safe primitives that allow safe concurrent access without mutexes
+    // You must specify memory ordering
+
+    // UnsafeCell -----
+
+    // An UnsafeCell is the primitive building block for interior mutability 
+    // It wraps a T but does not come with any conditions or restrictions to avoid undefined behavior
+    // Instead, the get() method gives a raw pointer to the value it wraps, which can be meaningfully used in unsafe blocks
+
+    // Thread Safety: Send and Sync
+
+    // In this chapter, we've seen several types that are not thread safe, types that can only be used on a single thread, such as Rc, Cell, and others
+    // Since that restriction is needed to avoid undefined behavior, it's something the compiler needs to understand and check for you, so you can use these types without having to use unsafe blocks
+
+    // The language uses 2 special traits to keep track of which types can be safely used across threads:
+        // - Send: A type is Send if it can be sent to another thread. In other words, if ownership of a value of that type can be transferred to another thread.
+        // - Sync: A type is Sync if it can be shared with another thread. In other words, a type T is Sync if and only if a shared reference to that type is Send. 
+    // All primitive types, such as i32, bool, and str are both Send and Sync
+
+    // Send and Sync are marker traits that define Rust's thread safety guarantees
+    // They are automatically implemented by the compiler for most types
+    // A type is Send if it's safe to transfer ownership to another thread
+    // A type is Sync if it's safe to share references across threads
+    // Send = "Can I move this to another thread?"
+    // Sync = "Can multiple threads safely hold &T at the same time?"
+
+    // Both of these traits are auto traits, which means that they are automatically implemented for your types based on their fields
+    // A struct with fields that are all Send and Sync are itself also Send and Sync
+
+    // The way to opt out of either of these is to add a field to your type that does not implement the trait
+    // For that purpose, the special std::marker::PhantomData<T> type comes in handy
+    // That type is treated by the compiler as T, except it doesn't actually exist at runtime
+    // It's a zero-sized type, taking no space
+
+    // Let's take a look at the following struct:
+
+    struct X {
+        handle: i32,
+        _not_sync: PhantomData<Cell<()>>,
+    }
+    // In this example, X would be both Send and Sync if handle was the only field
+    // However, we added a zero-sized PhantomData<Cell<()>> field, which is treated as it it were Cell<()>
+    // Since a Cell<()> is not a Sync, neither is X 
+    // The struct is send, however, since all of its fields implement Send
+
+    // Raw pointers are neither Send nor Sync, since the compiler doesn't know much about what they represent
+
+    // The way to opt in to either of the traits is the same as with any other trait: Use an impl block to implement the trait for your type
+    struct Y {
+        p: *mut i32,
+    }
+
+    unsafe impl Send for Y {}
+    unsafe impl Sync for Y {}
+
+    // Note how implementing these traits requires the unsafe keyword, since the compiler cannot check for you if it's correct
+    // It's a promise you make to the compiler, which it will have to trust
+    
+    // If you try to move something into another thread which is not Send, the compiler will politely stop you from doing that
+    // Such as with the example below:
+        // fn main() {
+        //     let a = Rc::new(123);
+        //     thread::spawn(move || { // Error!
+        //         dbg!(a);
+        //     });
+        // }
+    
+    // The thread::spawn function requires its argument to be Send and a closure is only Send if all of its captures are
+    // If we try to capture something that's not Send, our mistake is caught, protecting us from undefined behavior
+
+    // Locking: Mutexes and RwLocks -----
+
+    // The most commonly used tool for sharing (mutable) data between threads is mutex, which is short for mutual exclusion
+    // The job of a mutex is to ensure threads have exclusive access to some data by temporarily blocking other threads that try to access it at the same time
+    
+    // Conceptually, a mutex has only 2 states: locked and unlocked
+    // When a thread locks an unlocked mutex, the mutex is marked as locked and the thread can immediately continue
+    // When a thread then attempts to lock an already locked mutex, that operation will block
+    // The thread is put to sleep while it waits for the mutex to be unlocked
+    // Unlocking is only possible on a locked mutex, and should be done by the same thread that locked it
+    // If other threads are waiting to lock the mutex, unlocking it will cause one of those threads to be woken up, so it can try to lock the mutex again and continue its course
+
+    // Protecting data with a mutex is simply the agreement between all threads that they will only access the data they have mutex locked
+    // That way, no 2 threads can ever access that data concurrently and cause a data race
+
+    // Rust's Mutex -----
 
 }
