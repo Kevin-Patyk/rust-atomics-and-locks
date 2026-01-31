@@ -8,6 +8,9 @@ use std::thread;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::marker::PhantomData;
+use std::sync::Mutex;
+use std::cell::Cell;
+use std::time::Duration;
 
 fn f() {
     println!("Hello from another thread!");
@@ -540,4 +543,154 @@ fn main() {
 
     // Rust's Mutex -----
 
+    // The Rust standard library provides this functionality through std::sync::Mutex<T>
+    // It is a generic over type T, which is the type of the data the mutex is protecting
+    // By making T part of the mutex, the data can only be accessed through the mutex, allowing for a safe interface that can guarantee threeads will uphold this agreement
+
+    // To ensure a locked mutex can only be unlocked by a thread that locked it, it does not have an `unlock()` method
+    // Instead, `.lock()` returns a special type called a MutexGuard
+    // This guard represents the guarantee that we have locked the mutex
+    // It behaves like an exclusive reference through the DerefMut trait, giving us exclusive access to the data the mutex protects
+    // Unlocking the mutex is done by dropping the guard
+    // When we drop the guard, we give up our ability to addess the data, and the Drop implementation of the guard will unlock the mutex
+
+    // The code below spawns a thread scope
+    // Within the thread scope, we spawn 10 threads
+    // Each thread will acquire the lock and increment `n` 100 times
+    // Once the for loop ends, the thread finishes, so the guard is dropped and another thread can acquire the lock
+    let n = Mutex::new(0);
+
+    thread::scope(|s| {
+        for _ in 0..10 {
+            s.spawn(|| {
+                let mut guard = n.lock().unwrap();
+                for _ in 0..100 {
+                    *guard += 1;
+                }
+            });
+        }
+    });
+
+    assert_eq!(n.into_inner().unwrap(), 1000);
+    // Above, we have a Mutex<i32>, a mutex protecting an integer
+    // We spawn 10 threads to each increment the integer 100 times
+    // Each thread will first lock the mutex to obtain a MutexGuard and then use that guard to access the integer and modify it
+    // The guard is implicitly dropped right after, when that variable goes out of scope
+
+    // After the threads are done, we can safely remove the protection from the integer through `into_inner()`
+    // `into_inner()` takes ownership of the mutex, which guarantees that nothing else can have a reference to the mutex anymore, making lock unnecessary
+
+    // Even though the increments happen in steps of one, a thread observing the integer would only ever see multiples of 100, since it can only look at the integer when the mutex is unlocked
+    // Effectively, thanks to the mutex, the one hundred increments together are now a single indivisible (atomic) operation
+
+    // To clearly see the effect of the mutex, we can make each thread wait a second before unlocking the mutex
+    let n2 = Mutex::new(0);
+        thread::scope(|s| {
+            for _ in 0..10 {
+                s.spawn(|| {
+                    let mut guard = n2.lock().unwrap();
+                    for _ in 0..100 {
+                        *guard += 1;
+                    }
+                    thread::sleep(Duration::from_secs(1)); // New
+                });
+            }
+        });
+        assert_eq!(n2.into_inner().unwrap(), 1000);
+        // In the above example, the mutex is dropped when the thread finishes, after waiting for 1 second in each thread
+        // This will now take about 10 seconds to complete
+        // Each thread waits for one second, but the mutex ensures that only one thread at a time can do so
+        // Essentially, the lock remains held during the entire 1-second sleep, which forces threads to run sequentially
+
+        // If we drop the guard and unlock the mutex, before sleeping for one second, we will see it happen in parallel instead:
+        let n3 = Mutex::new(0);
+        thread::scope(|s| {
+            for _ in 0..10 {
+                s.spawn(|| {
+                    let mut guard = n3.lock().unwrap();
+                    for _ in 0..100 {
+                        *guard += 1;
+                    }
+                    drop(guard); // New: drop the guard before sleeping
+                    thread::sleep(Duration::from_secs(1));
+                });
+            }
+        });
+        assert_eq!(n3.into_inner().unwrap(), 1000);
+        // With this change, the program only takes about one second, since now the 10 threads can execute their one-second sleep at the same time
+        // This shows the importance of keeping the amount of time a mutex is locked as short as possible
+        // Keeping a mutex locked longer than necessary can completely nullify any benefits of parallelism, effectively forcing everythint to happen serially instead
+
+        // Lock Poisoning -----
+
+        // The .unwrap() calls in the examples above rlate to lock poisoning
+        
+        // A mutex in Rust gets marked as poisoned when a thread panics while holding the lock
+        // When that happens, the Mutex will no longer be locked, but calling its lock method will result in an Err to indicate it has been poisoned
+
+        // This is a mechanism to protect against leaving the data that's protected by a mutex in an inconsistent state
+        // In the examples above, if a thread would panic after incrementing the integer fewer than 100 times, the mutex would unlock and the integer
+        // would be left in an unexpected state where it is no longer a multiple of 100, possibly breaking assumptions made by other threads
+        // Automatically marking the mutex as poisoned in that case forces the user to handle this possibility
+
+        // Calling `lock()` on a poisoned mutex still locks the mutex.
+        // The Err return by `lock()` contains the MutexGuard, allowing us to correct an inconsistent state if necessary
+
+        // While lock poisoning might seem like a powerful mechanism, recovering from a potentially inconsistent state is not often done in practice
+        // Most code either disregards poison or uses `unwrap()` to panic if the lock was poisoned, effectively propagating panics to all users of the mutex
+
+        // Life of the MutexGuard -----
+
+        // While it's convenient that implicitly dropping a guard unlocks the mutex, it can sometimes lead to subtle surprises
+        // If we assign the guard a name with a `let` statement, it's relatively straightforward to see when it will be dropped 
+        // since local variables are dropped at the end of the scope they are defined in.
+        // Still, not explicitly dropping a guard might lead to keeping the mutex locked longer than necessary, as demonstrated in the examples above
+        
+        // Using a guard without assigning it a name is also possible and can be very convenient at times
+        // Since MutexGuard behaves like an exclusive reference to protected data, we can directly use it without assigning a name to the guard first
+        // For example, if you have a Mutex<Vec<i32>>, you can lock the mutex, push an item into the Vec, and unlock the mutex again in a single statement:
+            // list.lock().unwrap().push(1);
+        // The MutexGuard drops at the end here since, when you chain methods without assigning it to a variable, it has a temporary lifetime
+        // In Rust, temporaries are automatically dropped at the end of the statement (at the semicolon)
+        // As opposed to storing a guard in a variable, where the lock will be held until the variable goes out of scope
+        
+        // Any temporaries produced within a larger expression, such as the guard returned by `lock()`, will be dropped at the end of the statement.
+        // While this might seem obvious and resonable, it leads to a common pitfall that usually involves a `match`, `if let`, or `while let` statement
+        // Below is an example:
+            // if let Some(item) = list.lock().unwrap().pop() {
+            //     process_item(item);
+            // }
+        // If our intention was to lock the list, pop an item, unlock the list, and then process the item after the list is unlocked, we made an important mistake
+        // The temporary guard is not dropped until the end of the entire `if let` statement, meaning we needlessly hold on to the lock will processing the item
+        // This happens because Rust extends temporary lifetimes in certain contexts to keep them alive for the entire block
+        // This is usually helpful, but with locks it can accidentally create longer critical sections than intended
+
+        // Perhaps surprisingly, this does not happen for a similar `if` statement, such as in this example:
+            // if list.lock().unwrap().pop() == Some(1) {
+            //     do_something();
+            // }
+        // Here, the temporary guard does get dropped before the body of the `if` statement is executed
+        // The reason is that the condition of a regular `if` statement is always a plain boolean, which cannot borrow anything
+        // There is no reason to extend the lifetime of temporaries from the condition to the end of the statement
+        // For an `if let` statement, however, that might not be the case
+        // If we had used front() rather than pop(), `item` would be borrowed from the list, making it necessary to keep the guard around
+
+        // With `if let`, the pattern binding `Some(item)` can extend the temporary's lifetime
+        // But with a simple boolean condition `==Some(1)`, the temporary is dropped as soon as the value is extracted, before the comparison
+
+        // We can avoid this by moving the pop operation to a separate `let` statement
+        // Then the gard is dropped at the end of that statement, before the `if let`
+            // let item = list.lock().unwrap().pop();
+            // if let Some(item) = item {
+            //     process_item(item);
+            // }
+        // This works since `.pop()` returns an owned value `Option<T>` not a reference
+        // `.list.lock.unwrap()` creates a temporary MutexGuard
+        // `.pop()` extracts and returns an owned `Option<T>`
+        // `;` is when the statement ends, MutexGuard is dropped and the lock is released
+        // `item` stores the owned `Option<T>` which no longer needs a lock
+        // This pattern works when you move/copy data out of the mutex - it wouldn't work if you tried to keep a reference
+        // The above works since you're extracting the owned data before releasing the lock
+
+        // Reader-Writer Lock -----
 }
