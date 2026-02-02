@@ -11,6 +11,8 @@ use std::marker::PhantomData;
 use std::sync::Mutex;
 use std::cell::Cell;
 use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::Condvar;
 
 fn f() {
     println!("Hello from another thread!");
@@ -693,4 +695,218 @@ fn main() {
         // The above works since you're extracting the owned data before releasing the lock
 
         // Reader-Writer Lock -----
+
+        // A mutex is only concerned with exclusive access.
+        // The mutex guard will provide us an exclusive reference `&mut T` to the protected data, even if we only want to look at the data and a shared reference `&T` would have sufficed
+
+        // A reader-writer lock is a slightly more complicated version of a mutex that understands the difference between exlcusive and shared acess, and can provide either
+        // It has 3 states:
+            // Unlocked
+            // Locked by a single writer (for exclusive access)
+            // Locked by a number of readers (for shared access)
+        // It is commonly used for data that is often read by multiple threads but only updated once in awhile
+
+        // The Rust library provides this lock through the `std::sync::RwLock<T>` type
+        // It works similarly to the standard `Mutex`, except its interface is mostly split into 2 parts
+        // Instead of a single `.lock()` method, it has a `read()` and `write()` method for locking as either a reader or a writer
+        // It comes with 2 guard types, one for readers and one for writers
+        
+        // It is effectively the multi-threaded version of `RefCell`, dynamically tracking the number of references to ensure the borrow rules are upheld
+
+        // Both `Mutex<T>` and `RwLock<T>` require T to be `Send` since they can be used to send a `T` to another thread
+        // `RwLock<T>` additionally requires `T` to also implement `Sync` because it allows multiple threads to hold a shared reference `&T` to the protected data
+
+        // The Rust standard library provides only one general purpose `RwLock` type, but its implementation depends on the OS
+        // There are many subtle variations between reader-writer lock implementations
+        // Most implementations will block new readers when there is a writer waiting, even when the lock is already read locked
+        // This is done to prevent writer starvation, a situation where many readers collectively keep the lock from ever unlocking, never allowing the writer to update the data
+
+        // Waiting: Parking and Condition Variables -----
+
+        // When data is mutated by multiple threads, there are many situations where they would need to wait for some event, for some condition about the data to become true
+        // For example, if we have a mutex protecting a `Vec`, we might want to wait until it contains anything
+
+        // While a mutex does allow threads to wait until it becomes unlocked, it does not provide functionality for waiting for any other conditions
+        // If a mutex was all we had, we would have to keep locking the mutex to repeatedly check if there's anything in the `Vec` yet
+
+        // Thread Parking -----
+
+        // One way to wait for a notification from another thread is called thread parking
+        // A thread can park itself which puts it to sleep, stopping it from consuming any CPU cycles
+        // Another thread can then unpark the parked thread, waking it up from its nap
+
+        // Thread parking is available through the `std::thread::park()` function.
+        // For unparking, you call the `unpark()` method on a `Thread` object representing the thread you want to unpark
+        // Such an object can be obtained from the join handle returned by `spawn` or by the thread itself through `std::thread::current()`
+
+        //  Let's dive into an example that uses a mutex to share a queue between 2 threads
+        // In the following example, a newly spawned thread will consume items from the queue, while the main thread will insert a new item in the queue every second
+        // Thread parking is used to make the consuming thread wait until the queue is empty
+
+        // Creating a Mutex wrapped, double ended queue
+        let queue = Mutex::new(VecDeque::new());
+
+        // Spawning a scope thread that will have a single thread inside of it
+        // The thread inside of the scope will be the consumer thread
+        // As a note, thread::scope just creates a scope, it doesn't spawn any threads itself
+        thread::scope(|s| {
+            // Consuming thread
+            // We are using `loop` since we do not know how many items we will receive
+            let t = s.spawn(|| loop {
+                // Locking the mutex and popping from the front
+                // The MutexGuard will drop at the end of this statement
+                let item = queue.lock().unwrap().pop_front();
+                // If the value (item) matches the pattern (Some(item)), we bind item to item
+                // If it is Some(item), we use dbg!()
+                // If it is None, we park the thread
+                if let Some(item) = item {
+                    dbg!(item);
+                } else {
+                    thread::park();
+                }
+            });
+
+            // Producing thread
+            for i in 0.. {
+                // Locking the mutex and pushing to the back
+                // The MutexGuard will drop at the end of this statement
+                queue.lock().unwrap().push_back(i);
+                // Unparking the thread
+                t.thread().unpark();
+                //Sleeping for 1 second
+                thread::sleep(Duration::from_secs(1));
+            }
+
+        });
+        // We are using a `thread::scope` to get access to the thread handle `t` so we can call `t.thread().unpark()` from the producer thread
+        // `thread::scope` blocks and waits for all spawned threads to complete before returning
+        // If the producing thread were outside of the `thread::scope`, it would never run because the scope would never exit (due to the infinite loop)
+
+        // The consuming thread runs an infinite loop in which it pops items out of the queue to display them using the `dbg` macro
+        // When the queue is empty, it stops and goes to sleep using the `park()` function
+        // If it gets unparked, the `park()` call returns, and the `loop` continues, popping items for the queue again until it is empty, and so on
+
+        // The producing thread produces a new number every second by pushing it into the queue
+        // Every time it adds an item, it uses the `unpark()` method on the `Thread` object that referes to the consuming thread to unpark it
+        // That way, the consuming thread gets woken up to process the new element
+
+        // An import observation to make here is that this program would still be theoretically correct, although inefficient, if we remove parking.
+        // This is import because `park()` does not guarantee that it will only return because of matching `unpark()`
+        // While somewhat rare, it might have spurious wake-ups
+        // Our example deals with that just fine, because the consuming thread will lock the queue, see that it is empty, and directly unlock it and park itself again
+
+        // Key points from above:
+        // 1. Parking doesn't guarantee one-to-one wake ups
+            // `thread::park()` can wake up "spuriously" - meaning it might return even though no one called `unpark()` 
+        // 2. The code above handles this correctly
+            // If the thread wakes up spuriously, it loops back to the top, tries to pop, queue is empty, parks itself again
+        // 3. Without `park` it would be inefficient since it's a busy-wait loop that burns CPU constantly checking an empty queue
+
+        // The pattern: Always check your actual condition rather than trusting `park()`/`unpark()` to be perfectly synchronized
+
+        // Unpark requests are saved (but don't stack)
+            // - If you call `unpark()` before `park()`, the `unpark()` is remembered
+            // - The next `park()` will immediately return without sleeping
+            // - Multiple `unpark()` calls = only one saved request
+                // - unpark() → unpark() → park() → park() = thread sleeps on the second park
+        
+        // Bottom line: Park/unpark is simple but fragile. Always check your actual condition in a loop and consider alternatives for anymore more complex
+
+        // Condition Variables -----
+
+        // Condition varaibles are a more commonly used option for waiting for something to happen to data protected by a mutex
+        // They have 2 basic operations: wait and notify
+        // Threads can wait on a condition variable, after which they can be woken up when another thread notifies that same condition variable
+        // Multiple threads can wait on the same condition variable, and notifications can either be sent to one waiting thread or to all of them
+
+        // This means that we can create a condition variable for specific events or conditions we are interested in, such as the queue being non-empty and wait on that condition
+        // Any thread that causes that event or condition to happen then notifies the condition variable, without having to know which or how many threads are interested in that notification
+
+        // To avoid the issue of missing notifications in the brief moment between unlocking a mutex and waiting for a condition variable, condition variables provide a way to atomtically unlock the mutex and start waiting
+        // This means there is simply no possible moment for notifications to get lost
+
+        // The Rust standard library provides a condition variable as `std::sync::Condvar`
+        // Its `wait` method takes a `MutexGuard` that proves we've locked the mutex
+        // It first unlocks the mutex and goes to sleep
+        // Later, when woken up, it relocks the mutex and returns a new MutexGuard
+
+        // It has 2 notify functions: `notify_one` to wake up just one waiting thread and `notify_all` to wake them all up
+
+        // Create an empty queue wrapped in mutex
+        let queue2 = Mutex::new(VecDeque::new());
+        // Spawn a new conditional variable
+        let not_empty = Condvar::new();
+
+        // Spawn a new thread scope
+        thread::scope(|s| {
+
+            // Spawn a thread within the scope
+            s.spawn(|| {
+                loop {
+                    // Lock the mutex
+                    let mut q = queue2.lock().unwrap();
+                    let item = loop { // Inner loop: wait until queue has an item
+                        if let Some(item) = q.pop_front() {
+                            break item; // Got an item - break out with it
+                        } else { // Queue is empty, wait for notification
+                            q = not_empty.wait(q).unwrap(); // Releases lock, sleeps, reacquires lock when woken
+                        }
+                    };
+                    // Drop the mutex guard 
+                    drop(q);
+                    dbg!(item); // Process the item
+                }
+            });
+
+            for i in 0.. {
+                queue2.lock().unwrap().push_back(i);
+                not_empty.notify_one();
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
+
+        // We had to change a few things:
+            // We now not only have a Mutex containing the queue, but also a Condvar to communicate the not empty condition
+            // We no longer need to know which thread to wake up, so we don't store the return value from spawn anymore
+                // Instead, we notify the consumer through the condition variable with the `notify_one` method
+            // Unlocking, waiting, and relocking is all done by the `wait` method
+                // We had to structure the control flow a bit to be able to pass the guard to the `wait` method, while still dropping before processing
+        
+        // Step-by-step:
+            // 1. Check: Is the queue empty?
+            // 2. If yes: Call `wait()` - this release the lock and sleeps
+            // 3. Producer adds an item and calls `notify_one()`
+            // 4. Consumer wakes up with the lock reacquired
+            // 5. Loop back to step 1 - check if the queue is not empty now
+            // 6. If there's an item: Pop it and break out of the loop
+        // We use the loop because `wait()` might wake up even if the queue is still empty, so you must re-check the condition each time you wake up
+        
+        // Now we can spawn as many consuming threads as we like and even spawn more later without having to change anything
+        // The condition variable takes care of delivering notifications to whichever thread is interested
+
+        // If we had a more complicated system with threads that are interested in different conditions, we could define a `Condvar` for each condition
+        // For example, we could define one to indicate the queue is non-empty and another one to indicate it is empty
+        // Then, each thread would wait for whichever condition relevant to what they are doing
+
+        // Normally, a `Condvar` is only ever used together with a single Mutex
+        // If 2 threads try to concurrently `wait` on a condition variable using 2 different mutex, it might cause a panic
+
+        // A downside of a `Condvar` is that it only works when used together with a `Mutex`, but for most use-cases this is perfectly fine, as that's exactly what's already
+        // used to protect the data anyway
+
+        // Summary -----
+
+        // - Multiple threads can run concurrently within the same program and can be spawned at any time
+        // - When the main thread ends, the entire program ends
+        // - Data races are undefined behavior, which is fully prevented (in safe code) by Rust's type system
+        // - Data that is `Send` can be sent to other threads and data that is `Sync` can be shared between threads
+        // - Regular threads might run as long as the program does, and thus can only borrow `'static` data such as statics and leaked allocations
+        // - Reference counting (`Arc`) can be used to share ownership to make sure data lives as long as at least one thread is using it
+        // - Scoped threads are useful to limit the lifetime of a thread to allow it to borrow non-`'static` data, such as local variables
+        // - `&T` is a shred reference, `&mut T` is an exclusive reference. Regular types don't allow mutation through a shared reference
+        // - Some types have interior mutability, which allows for mutation through shared references
+        // - `Cell` and `RefCell` are the standard type for single-threaded interior mutability. Atomics, `Mutex`, and `RwLock` are their multi thread equivalents
+        // - `Cell` and atomics only allowing replacing the values as a whole. `RefCell`, `Mutex`, and `RwLock` allow you to mutate the value directly by dynamically enforcing access rules
+        // - Thread parking can be a convenient way to wait for some condition
+        // -  When a condition is about data protected by a `Mutex`, using `Condvar` is more convenient and can be more efficient than thread parking
 }
