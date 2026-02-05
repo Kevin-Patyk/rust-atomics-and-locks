@@ -266,7 +266,7 @@ fn main() {
         //     pub fn swap(&self, v: i32, ordering: Ordering) -> i32; // "fetch_store"
         // }
     
-    // The one outlier is the operation that simple stores a new value, regardless of the old value
+    // The one outlier is the operation that simply stores a new value, regardless of the old value
     // Instead of `fetch_store`, it has been called `swap`
 
     // Here is a quick demonstration showing how `fetch_add` returns the value before the operation
@@ -290,5 +290,44 @@ fn main() {
 
     // Example: Progress Reporting from Multiple Threads -----
 
+    // In "Example: Progress Reporting", we used an `AtomicUsize` to report the progress of a background thread
+    // If we had split the work over, for example, four threads with each processing 25 items, we'd know to know the progress from all 4 threads
     
+    // We could use a separate `AtomicUsize` for each thread and load them all in the main thread and sum them up, but an easier
+    // solution is to use a single `AtomicUsize` to track the total number of processed items over all threads
+
+    // To make that work, we can no longer use the `store` method, as that would overwrite progress from other threads
+    // Instead, we can use an atomic add operation to increment the counter after every processed item
+
+    // Let's update the example from "Example: Progress Reporting" to split the work over four threads:
+
+    let num_done = AtomicUsize::new(0);
+
+    let main_thread = thread::current();
+
+    thread::scope(|s| {
+        // A background thread to process all 100 items.
+        s.spawn(|| {
+            for i in 0..100 {
+                process_item(i); // Assuming this takes some time.
+                num_done.store(i + 1, Relaxed);
+                main_thread.unpark(); // Wake up the main thread.
+            }
+        });
+
+        // The main thread shows status updates.
+        loop {
+            let n = num_done.load(Relaxed);
+            if n == 100 { break; }
+            println!("Working.. {n}/100 done");
+            thread::park_timeout(Duration::from_secs(1));
+        }
+    });
+
+    println!("Done!");
+
+    // The problem with `store` in a multi-threaded context, is that with multiple threads, they would be overwriting each other
+    // The counter would jump around erratically and you'd lost track of the actual total progress across all threads
+    // `store` overwrites the entire value, so it only works with one writer thread, whereas `fetch_add` atomically increments, so multiple threads can contribute to the same counter
+    // without losing each other's progress
 }
