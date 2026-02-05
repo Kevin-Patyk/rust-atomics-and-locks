@@ -35,6 +35,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicI32;
 
 fn main() {
     // Atomic Load and Store Operations -----
@@ -235,5 +236,59 @@ fn main() {
     // You could implement this using a condition variable or thread parking but that quickly gets too complicated for a small example
     // The Rust standard library provides exactly this functionality through `std::sync::Once` and `std::sync::OnceLock`, so there's usually no need to implement these yourself
 
+    // Here are the key points about atomic load and store operations:
+        // - Thread-safe access - Load and store operations on atomic types can be safely called from multiple threads simultaneously without data races
+        // - Indivisible operations - Each load or store completes as a single uninterruptible operation - you can't observe half-written values
+        // - Memory ordering - You specify an ordering that controls how the operation synchronizes with other threads
+        // - Load reads, store writes - `load()` reads the current value from the atomic, `store()` writes a new value to it
+        // - No locks required - these operations use CPU-level atomic instructions rather than locks, making them very fast for simple operations
+        // - Return values - `load()` returns the value, `store()` returns nothing (just a write operation)
+
     // Fetch-and-Modify Operations -----
+
+    // Now that we have seen a few use cases for `load()` and `store()`, let's move on to more interesting operations: the fetch-and-modify operations
+    // These operations modify the atomic variable, but also load (fetch) the original value, as a single atomic operation
+
+    // The most commonly used ones are `fetch_add` and `fetch_sub`, which perform addition and subtraction, respectively
+    // Some of the other available ones are `fetch_or` and `fetch_and` for bitwise operation
+    // `fetch_max` and `fetch_min` can be used to keep a running maximum or minimum
+
+    // Their function signatures are:
+        // impl AtomicI32 {
+        //     pub fn fetch_add(&self, v: i32, ordering: Ordering) -> i32;
+        //     pub fn fetch_sub(&self, v: i32, ordering: Ordering) -> i32;
+        //     pub fn fetch_or(&self, v: i32, ordering: Ordering) -> i32;
+        //     pub fn fetch_and(&self, v: i32, ordering: Ordering) -> i32;
+        //     pub fn fetch_nand(&self, v: i32, ordering: Ordering) -> i32;
+        //     pub fn fetch_xor(&self, v: i32, ordering: Ordering) -> i32;
+        //     pub fn fetch_max(&self, v: i32, ordering: Ordering) -> i32;
+        //     pub fn fetch_min(&self, v: i32, ordering: Ordering) -> i32;
+        //     pub fn swap(&self, v: i32, ordering: Ordering) -> i32; // "fetch_store"
+        // }
+    
+    // The one outlier is the operation that simple stores a new value, regardless of the old value
+    // Instead of `fetch_store`, it has been called `swap`
+
+    // Here is a quick demonstration showing how `fetch_add` returns the value before the operation
+    let a = AtomicI32::new(100);
+    // Adds 23 to the previous value and stores 100 in a new variable (b)
+    let b = a.fetch_add(23, Relaxed);
+    let c = a.load(Relaxed);
+
+    assert_eq!(b, 100);
+    assert_eq!(c, 123);
+
+    // The `fetch_add` operation incremented a from 100 to 123, but returns to use the old value of 100
+    // Any next operation will see the value of 123
+
+    // The return value from these operations is not always relevant
+    // If you only need the operation to be applied to the atomic value, but are not interested in the value itself, it's perfectly fine to simply ignore the return value
+    
+    // An important thing to keep in mind is that `fetch_add` and `fetch_sub` implement wrapping behavior for overflows
+    // Incrementing a value past the maximum representable value will wrap around and result in the minimum representable value
+    // This is different than the behavior of the plus and minus operators on regular integers, which will panic in debug mode on overflow
+
+    // Example: Progress Reporting from Multiple Threads -----
+
+    
 }
