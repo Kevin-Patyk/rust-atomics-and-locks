@@ -177,7 +177,7 @@ fn main() {
 
     println!("Done!");
     // In the previous version:
-        // THe main thread unconditionally sleeps for 1 full second between checks
+        // The main thread unconditionally sleeps for 1 full second between checks
         // Checks the progress exactly once per second, no matter what
         // Could wait up to 1 second after the work completes before printing "Done"
     // In the new version:
@@ -301,28 +301,44 @@ fn main() {
 
     // Let's update the example from "Example: Progress Reporting" to split the work over four threads:
 
-    let num_done = AtomicUsize::new(0);
-
-    let main_thread = thread::current();
+    let num_done = &AtomicUsize::new(0);
 
     thread::scope(|s| {
-        // A background thread to process all 100 items.
-        s.spawn(|| {
-            for i in 0..100 {
-                process_item(i); // Assuming this takes some time.
-                num_done.store(i + 1, Relaxed);
-                main_thread.unpark(); // Wake up the main thread.
-            }
-        });
+        // Four background threads to process all 100 items, 25 each.
+        for t in 0..4 {
+            // We use the `move` keyword to capture `t` (move it into the closure)
+            s.spawn(move || {
+                // Each thread processes its own 25 item chunk
+                for i in 0..25 {
+                    process_item(t * 25 + i); // Assuming this takes some time.
 
-        // The main thread shows status updates.
+                    // Atomically increment the shared counter by 1
+                    // This is thread safe - all 4 threads can call this simultaneously
+                    // and the total will always be correct (no lost updates)
+                    // We are not doing anything with the value that is "fetched"
+                    num_done.fetch_add(1, Relaxed);
+                }
+            });
+        }
+
+        // The main thread shows status updates, every second.
         loop {
+            // Read the current count of completed items
+            // This is safe to do while other threads are still incrementing
             let n = num_done.load(Relaxed);
+
+            // Once all 100 items are done, exit the loop
             if n == 100 { break; }
             println!("Working.. {n}/100 done");
-            thread::park_timeout(Duration::from_secs(1));
+
+            // Wait 1 second before checking again
+            // This prevents spamming the console with updates
+            thread::sleep(Duration::from_secs(1));
         }
     });
+    // The `thread::scope` waits for all spawned threads to finish before continuing
+    // The closing brace blocks until all 4 threads finish
+    // This is why scoped threads can borrow safely from the outer scope
 
     println!("Done!");
 
@@ -330,4 +346,24 @@ fn main() {
     // The counter would jump around erratically and you'd lost track of the actual total progress across all threads
     // `store` overwrites the entire value, so it only works with one writer thread, whereas `fetch_add` atomically increments, so multiple threads can contribute to the same counter
     // without losing each other's progress
+
+    // A few things have changed
+    // Most importantly, we now spawn 4 background threads rather one one and use `fetch_add` instead of `store` to modify the `num_done` atomic variable
+
+    // More subtly, we now use a `move` closure for the background threads and `num_done` is now a reference
+    // This is not related to our use of `fetch_add` but rather to how we spawn four threads in a loop
+    // This closure captrues `t` to know which of the four threads it is and thus whether we start at item 0, 25, 50, or 75
+    // Without the `move` keyword, the closure would try to capture `t` by reference, which isn't allowed since it only exists briefly during the loop
+
+    // As a `move`, closure it captures rather than borrowing them, giving it a copy of `t`.
+    // Because it also captures `num_done`, we have changed that variable to be a reference since we still want to borrow that same `AtomicUsize`
+    // Atomic types do not implement the `Copy` trait so we would have gotten an error if we had tried to move one into more than one thread
+
+    // Scoped threads with borrows are like simpler, zero-cost verions of `Arc` that work when you have clear lifetime guarantees
+
+    // Closure capture subtleties aside, the change to use `fetch_add` here is very simple
+    // We don't know in which order threads will increment `num_done`, but as the addition is atomic, we don't have to worry about anything and can be sure it 
+    // will be exactly 100 when all threads done
+
+    // Example: Statistics -----
 }
