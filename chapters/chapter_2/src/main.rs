@@ -36,6 +36,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicU32;
 
 fn main() {
     // Atomic Load and Store Operations -----
@@ -366,4 +367,179 @@ fn main() {
     // will be exactly 100 when all threads done
 
     // Example: Statistics -----
+
+    // Continuing with this concept of reporting what other threads are doing through atomics, let's extend our example to also collect and report some statistics on the time it takes 
+    // to process an item
+
+    // Next to `num_done`, we are adding 2 atomic variables: `total_time` and `max_time` to keep track of the amount of time spent processing items
+    // We will use these to report the average and peak processing times
+
+    // Create 3 atomic counters, all as references from the start
+    // This makes them easier to share with the spawned threads
+    let num_done = &AtomicUsize::new(0);
+    let total_time = &AtomicU64::new(0);
+    let max_time = &AtomicU64::new(0);
+
+    // Create a thread scope
+    thread::scope(|s| {
+        // Four background threads to process all 100 items, 25 each
+        for t in 0..4 {
+            s.spawn(move || {
+                // Eacg thread processes its chunk of 25 items
+                for i in 0..25 {
+                    // Start timing this item
+                    let start = Instant::now();
+
+                    // Do the actual work
+                    process_item(t * 25 + i); // Assuming this takes some time
+
+                    // Calculate how long it took (in microseconds)
+                    let time_taken = start.elapsed().as_micros() as u64;
+
+                    // Atomatically increment the "done" counter
+                    num_done.fetch_add(1, Relaxed);
+
+                    // Atomically add this item's time to the running total
+                    // This lets us calculate average later
+                    total_time.fetch_add(time_taken, Relaxed);
+
+                    // Atomically update the max if this item took longer than previous
+                    // fetch_max only updates if time_taken > max_time
+                    max_time.fetch_max(time_taken, Relaxed);
+                }
+            });
+        }
+
+        // The main thread shows status updates, every second=
+        loop {
+            let total_time = Duration::from_micros(total_time.load(Relaxed));
+            let max_time = Duration::from_micros(max_time.load(Relaxed));
+            let n = num_done.load(Relaxed);
+            if n == 100 { break; }
+            if n == 0 {
+                println!("Working.. nothing done yet.");
+            } else {
+                println!(
+                    "Working.. {n}/100 done, {:?} average, {:?} peak",
+                    total_time / n as u32,
+                    max_time,
+                );
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    });
+
+    println!("Done!");
+
+    // In the above example, we are creating references to the atomics to make it cleaner to use in closures
+    // Since we are using a thread scope, we can borrow local variables since it ensures that all threads will finish when the scope ends
+
+    // The background threads now use `Instant::now()` and `Instant::elapsed()` to measure the time they spend in `process_item()`.
+    // An atomic add operation is used to keep track of the microseconds to `total_time` and an atomic max operation is used to keep track of the
+    // highest measurement in `max_time`.
+    
+    // The main thread divides the total time by the number of processed items to obtain the average processing time, which it then reports together
+    // with the peak time from `max_time`.
+
+    // Since the 3 atomic variables are updated separately, it is possible for the main thread to load the values after a thread has incremented `num_done`
+    // but before it has updated `total_time`, resulting in an underestimate of the average. 
+    // More subtly, because the `Relaxed` memory ordering gives no guarantees about the relative order of operations as seen from another thread, it might even
+    // briefly see a new updated value of `total_time` while still seeing an old value of `num_done`, resulting in an overestimate
+
+    // Neither of this is a big issue in our example. The worst that can happen is that an inaccurate average is briefly reported to the user.
+
+    // If we want to avoid this, we can put the three statistics inside a `Mutex`.
+    // Then, we would briefly lock the mutex while updating the 3 numbers, which no longer have to be atomic by themselves.
+    // This effectively turns the 3 updates into a single atomic operation, at the cost of locking and unlocking a mutex and potentially temporarily blocking threads
+
+    // You could, for example, put the 3 statistics you want to track as fields in a struct, then wrap that struct in a mutex
+    // so that each thread updates all 3 when it acquires the lock, rather than each separate atomic value being updated individually
+
+    // Example: ID Allocation -----
+
+    // Let's move on to a use case where we actually need to return the value from `fetch_add`.
+
+    // Suppose we need some function, `allocate_new_id()` that gives a new unique number every time it is called
+    // We might use these numbers to identify tasks or othings in our program; things that need to be uniquely identified by something small that
+    // can be easily stored and passed around between threads, such as an integer. 
+
+    fn allocate_new_id() -> u32 {
+        // static = lives for the entire program, shared by all calls
+        // its an atomic (thread safe) counter
+        static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+        
+        // Atomically: read current value, add 1, return the old value
+        NEXT_ID.fetch_add(1, Relaxed)
+    }
+    // Even if the above function is called multiple times, the line with `static` only runs once whe nthe program starts
+    // or the first time the function is called
+    // In the first call, NEXT_ID would be created and initialized at 0, then `fetch_add()` runs, returns 0 and NEXT_ID becomes 1
+    // On the second call, NEXT_ID already exists, so initialization is skipped, then we go to `fetch_add()`
+    // If we were to use `let next_id = ...`, it would be created fresh every call
+
+    // We simply keep track of the next number to give out and increment it every time we load it
+    // The first caller will get 0, the second 1, and so on.
+
+    // The only problem here is the wrapping behavior on overflow.
+    // The 4,294,967,296th call will overflow the 32-bit integer, such that the next call will return 0 again
+
+    // Whether this is a problem depends on the use case: how likely is it to be called this often, and what's the worst that can happen if the numbers are not unique?
+    // While this might seem like a huge number, modern computers can easily execute our function that many times within seconds
+    // If memory safety is dependent on these numbers being unique, our implementation above is not acceptable
+
+    // To solve this, we can attempt to make the function panic if it is called too many times, like this:
+    // This version is problematic.
+    fn allocate_new_id() -> u32 {
+        static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+        let id = NEXT_ID.fetch_add(1, Relaxed);
+        assert!(id < 1000, "too many IDs!");
+        id
+    }
+    // Now, the `assert` statement will panic after a thousand calls
+    // However, this happens after the atomic add operation already happened, meaning that NEXT_ID has already been incremented to 100 when we panic
+    // If another thread then calls the function, it'll increment it to 1002 before panicking and so on
+    // Although it might take significantly longer, we will run into the same problem after 4,294,966,296 panics when NEXT_ID will overflow to 0 again
+
+    // There are 3 common solutions to this problem:
+        // 1. Not panic, but instead completely abort the process on overflow
+            // - The `std::process::abort` function will abort the entire process, ruling out the possibility of anything continuing to call our function
+            // - While the aborting process might take a brief moment in which the function can still be called by other threads, the chance of that happening
+            // - before the program is truly aborted is negligible.
+            // This is how the overflow check in `Arc::clone()` is implemented, in case you somehow manage to clone it `isize::MAX` times
+            // That would take hundreds of years on a 64-bit computer, but is achievable in seconds if `isze` is only 32 bits
+    
+    // As a reminder, the above is about integer overflow - when atomics "wrap around" after reaching their maximum value
+    // They will overflow back to 0
+    // `Arc::clone()` has overflow checks that aborts the process if you somehow many to clone it too many times
+    // If it overflows:
+        // It wraps around to 0
+        // Arc thinks there are 0 references
+        // It might drop the data prematurely while clones still exist
+        // Use-after-free bugs, crashes, data corruption
+
+    // A second way to deal with the overflow is to use `fetch_sub` to decrement the counter again before panicking:
+    fn allocate_new_id() -> u32 {
+        static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+        let id = NEXT_ID.fetch_add(1, Relaxed);
+        if id >= 1000 {
+            NEXT_ID.fetch_sub(1, Relaxed);
+            panic!("too many IDs!");
+        }
+        id
+    }
+
+    // It's still possible for the counter to very briefly be incremented beyond 100 when multiple threads execute this function as the same time
+    // But it is limited by the number of active threads
+    // It's reasonable to assume there will never be billions of active threads at once, especially not all simultaneously exeucing the same function 
+    // in the brief moment between `fetch_add` and `fetch_sub`
+
+    // This is how overflows are handled for the number of running threads in the standard library's `thread::scope` implementation
+
+    // The third way of handling overflows is arguably the truly correct one, as it prevents the addition from happening at all if it would overflow
+    // However, we cannot implement that with the atomic operations we've seen so far
+    // For this, we would need compare-and-exchange operations.
+
+    // Compare-and-Exchange Operations -----
+
+    
 }
