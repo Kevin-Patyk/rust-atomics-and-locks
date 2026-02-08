@@ -541,5 +541,220 @@ fn main() {
 
     // Compare-and-Exchange Operations -----
 
+    // The most advanced and flexible atomic operation is the compare-and-exchange operation.
+    // This operation checks if the atomic value is equal to a given value and only if that is the case does it replace it with a new value, all atomically in a single operation
+    // It will return the previous value and tell us wheter it replaced it or not
+
+    // Its signature is a bit more complicated then the ones we've seen so far
+    // Using `AtomicI32` as an example, it looks like this:
+        // impl AtomicI32 {
+        //     pub fn compare_exchange(
+        //         &self,
+        //         expected: i32,
+        //         new: i32,
+        //         success_order: Ordering,
+        //         failure_order: Ordering
+        //     ) -> Result<i32, i32>;
+        // }
     
+    // Ignoring memory ordering for a moment, it is basically identical to the following implementation, except it all happens as a single, indivislbe atomic operation:
+        // impl AtomicI32 {
+        //     pub fn compare_exchange(&self, expected: i32, new: i32) -> Result<i32, i32> {
+        //         // In reality, the load, comparison and store,
+        //         // all happen as a single atomic operation.
+        //         let v = self.load();
+        //         if v == expected {
+        //             // Value is as expected.
+        //             // Replace it and report success.
+        //             self.store(new);
+        //             Ok(v)
+        //         } else {
+        //             // The value was not as expected.
+        //             // Leave it untouched and report failure.
+        //             Err(v)
+        //         }
+        //     }
+        // }
+
+    // Using this, we can load a value from an atomic variable, perform any calculation we like, and then only store the new calculated value if the atomic variable didnt change
+    // in the meantime.
+    
+    // To demonstrate, let's increment `AtomicU32` by one without using `fetch_add` just to see how `compare_exchange` is used in practice:
+        // fn increment(a: &AtomicU32) {
+        //     let mut current = a.load(Relaxed); 1
+        //     loop {
+        //         let new = current + 1; 2
+        //         match a.compare_exchange(current, new, Relaxed, Relaxed) { 3
+        //             Ok(_) => return, 4
+        //             Err(v) => current = v, 5
+        //         }
+        //     }
+        // }
+    // 1. First, we load the current value of `a`
+    // 2. We calculate the new value we want to store in `a`, not taking into account potential concurrent modifications by other threads
+    // 3. We use `compare_exchange` to update the value of `a` but only if its value is still the same value we loaded before
+    // 4. If `a` was indeed still the same as before, it is now replaced bu our new value and we are done
+    // 5. If it was not the same as before, another thread must have changed it in a brief moment since we loaded it
+        // The `compare_exchange` operation gives us the changed value that `a` had and we'll try again using that value instead
+        // The brief moment between loading and updating is so short that it's unlikely for this to loop more than a few iterations
+    
+    // Next to `compare_exchange`, there is a similar method called `compare_exchange_weak`.
+    // The difference is that the weak version may still sometimes leave the value untourched and return an `Err`, even through the atomic value matched the expected value
+    // On some platforms, this method can be implemented more efficiently and should be preferred in cases where the consequence of a spurious compare-and-exchange
+    // failure are insignificant, such as our `increment` function above
+    // In Chapter 7, we will dive into the low-level details to find out why the weak version can be more efficient
+
+    // Example: ID Allocation Without Overflow ----- 
+
+    // Now, back to our overflow problem in `allocate_new_id` from earlier
+
+    // To stop incrementing NEXT_ID beyond a certain limit to prevent overflows, we can use `compare_exchange` to implement atomic addition with an upper bound
+    // Using that idea, let's make a version of `allocate_new_id` that always handles overflow correctly, even in practically impossible situations
+    fn allocate_new_id() -> u32 {
+        // Static atomic counter shared across all calls and threads
+        // Initialized once to 0, persists for the entire program lifetime
+        static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+
+        // Load the current counter value to use as our "expected" value
+        // This is our starting point for the compare-exchange loop
+        let mut id = NEXT_ID.load(Relaxed);
+        loop {
+            // Check if we have exceeded the ID limit before attempting allocation
+            // This prevents the counter from ever going beyong 1000
+            // unlike `fetch_add` approach which could temporarily overshoot
+            assert!(id < 1000, "too many IDs!");
+
+            // Try to atomically updated NEXT_ID from `id` to `id + 1`
+            // `compare_exchange_weak` does:
+                // - If NEXT_ID == id, set NEXT_ID to id + 1 and return Ok(id)
+                // - If NEXT_ID != id, return Err(actual_current_value)
+            //
+            // "weak" version: may spuriously fail even when values match, but it's faster, which is fine since we are in a retry loop
+            //
+            // Parameters: (expected, new, success_ordering, failure_ordering)
+            match NEXT_ID.compare_exchange_weak(id, id + 1, Relaxed, Relaxed) {
+
+                // Success! We atomically claimed `id` and incremented the counter
+                // No other thread got this ID - it's uniquely ours
+                Ok(_) => return id,
+
+                // Failure! Another thread changed NEXT_ID between our load and compare_exchange
+                // `v` contains the actual current value of NEXT_ID
+                // update our local `id` to this new value and retry
+                Err(v) => id = v,
+            }
+        }
+        // This loop continues until:
+        // 1. We successfully claim an ID (Ok case) OR
+        // 2. The assert fails because id >= 1000
+    }
+
+    // Now we check and panic before modifying NEXT_ID, guaranteeing it will never be incremented beyond 100, making overflow impossible
+    // We can now raise the upper limit from 100 to u32::MAX if we want, without having to worry about edge cases which it might get incremented beyond the limit
+
+    // Fetch-Update -----
+
+    // The atomic types have a convenience method called `fetch_update` for the compare-and-exchange loop pattern
+    // It's equivalent to a `load` operation followed by a loop that repeats a calculation and `compare_exchange_week`
+    // Using it, we could implement our `allocate_new_id` function with a one-liner:
+        // NEXT_ID.fetch_update(Relaxed, Relaxed,
+        //     |n| n.checked_add(1)).expect("too many IDs!")
+    
+    // Essentially, `fetch_update` is a convenient wrapper around the compare-and-exchange loop pattern
+    // It takes a closure that computes the new value and handles the try loop for you
+    // How it works:
+        // Your closure receives the current value
+        // Return `Some(new_value)` to update or `None` to abort
+        // `fetch_update` handles the compare-exchange loop internally
+        // Returns `Ok(old_value)` on success or `Err(current_value)` if closure returned `None`
+    // It's basically: "Keep trying to update the atomic with this function until it succeeds or you return `None`"
+
+    // Example: Lazy One-Time Initialization -----
+
+    // In the earlier example of lazy initialization, we looked at an example of lazy initialization of a constant value
+    // We made a function that lazily initializes a value on the first call, but reuses it on later calls
+    // When multiple threads run the function concurrently during the first call, more than one thread might execute the initialization
+    // and they will overwrite each others' results in an unpredictable manner.
+
+    // This is fine for values that we expect to be constant or when we don't care about changing values
+    // However, there are also use cases where such a value gets initialized to a different value each time, even though we need 
+    // every invocation of the function within a single run of the program to return the same value
+
+    // For example, imagine `get_key()` that returns a randomly generated key that's only generated once per run of the program.
+    // It might be an encryption key used for communication within the program, which needs to be unique every time the program is run, but stays constant within a process
+
+    // This means we cannot simple use a `store` operation after generating a key, since that might overwrite a key generated by another thread just moments ago
+    // resulting in 2 threads using different keys
+    // Instead, we can use `compare_exchange` to make sure we only store the key if no other thread has already done so, and otherwise throw our key away 
+    // and use the stored key instead 
+
+    // Here is an implementation of this idea: 
+    fn get_key() -> u64 {
+        // Static atomic variable shared across all calls and threads
+        // Initialized to 0, which signals "not yet generated"
+        // Once set to non-zero, it persists for the entire program
+        static KEY: AtomicU64 = AtomicU64::new(0);
+
+        // Load the current key value
+        // This is our first check to see if a key already exists
+        let key = KEY.load(Relaxed);
+
+        // Check if the key hasn't been intialized yet (still 0)
+        if key == 0 {
+            // Generate a new random key
+            // This might be expensive
+            // Multiple threads might reach this point and each generate their own key
+            let new_key = generate_random_key(); // 1
+            // Try to atomically store our generated key, but only if the key is still 0
+            // This is a race: multiple thread might try this simultaneously
+            // compare_exchange: "If key == 0", set key = new_key, else fail"
+            // Parameters: (expected_value, new_value, success_ordering, failure_ordering)
+            match KEY.compare_exchange(0, new_key, Relaxed, Relaxed) { // 2
+                // Success, we won the race - key was still 0, now it's our new key
+                // We were the first thread to initialize the key
+                // Return the key we just successfully stored
+                Ok(_) => new_key, // 3
+                // Failure, another thread beat us to it
+                // Key is no longer 0 - someone else already initialized it
+                // `k` contains the key that the other thread stored
+                // Discard our generated key and use theirs instead
+                // This ensures all threads use the same key
+                Err(k) => k, // 4
+            }
+        } else {
+            // Key was already initialized (non-zero)
+            // Just return the existing key
+            // This is the fast path - no compare_exchange needed
+            key
+        }
+        // 1. We only generate a new key if KEY was not yet initialized
+        // 2. We replace KEY with our newly generated key, but only if it is still 0
+        // 3. If we swapped the 0 for our new key, we return our newly generated key
+            // New invocations of `get_key()` will return the same new key that's now stored in KEY
+        // 4. If we lost the race to another thread that initialized KEY before we could, we forget our newly generated key and used the key from KEY instead
+
+        // This is a good example of a situation where `compare_exchange` is more appropriate than its weak variant
+        // We don't run our compare-and-exchange operation in a loop and we don't want to return 0 if the operation spuriosly fails
+
+        // If `generate_random_key()` takes a lot of time, it might make more sense to blocks threads during initialization, to avoid 
+        // potentially spending time generating keys that will not be used.
+        // The Rust standard library provides such functionality through `std::sync::Once` and `std::sync::OnceLock`.
+
+        // Summary -----
+
+        // - Atomic operations are indivisible; they have either fully complated or haven't happened yet
+        // - Atomic operations in Rust are done through the atomic types in `std::sync::atomic`
+        // - Not all atomic types are available on all platforms
+        // - The relative ordering of atomic operations is tricky when multiple variables are involved
+        // - Simple loads and stores are nice for very basic inter-thread communication, like stop flags or status reporting
+        // - Lazy initialization can be done as a race, without causing a data race
+        // - Fetch-and-modify operations allow for a small set of basic atomic modifications that are especially useful when multiple threads are modifing the same atomic variable
+        // - Atomic addition and subtraction silently wrap around on overflow
+        // - Compare-and-exchange operations are the most flexible and general, and a building block for making any other atomic operation
+        // - A weak compare-and-exchange operation can be slightly more efficient
+
+        // Random Notes -----
+
+        // `static` = This is THE counter/state for the whole program
+        // `Arc` = Here's A counter/state I want to share with some threads
 }
